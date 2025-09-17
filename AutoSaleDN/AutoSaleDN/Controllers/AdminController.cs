@@ -9,6 +9,7 @@ using OfficeOpenXml;
 
 namespace AutoSaleDN.Controllers
 {
+
     [Route("api/[controller]")]
     [ApiController]
     [Authorize(Roles = "Admin")]
@@ -447,12 +448,12 @@ namespace AutoSaleDN.Controllers
                         ListingId = sl.ListingId,
                         ShowroomId = sl.StoreLocationId,
                         ShowroomName = sl.StoreLocation.Name,
-                        Quantity = sl.CurrentQuantity
+                        Quantity = sl.InitialQuantity
                     }).ToList(),
 
                     // Derived Status and Available Units
-                    Status = c.StoreListings.Any(sl => sl.CurrentQuantity > 0) ? "Available" : "Unavailable",
-                    AvailableUnits = c.StoreListings.Sum(sl => (int?)sl.CurrentQuantity) ?? 0
+                    Status = c.StoreListings.Any(sl => sl.InitialQuantity > 0) ? "Available" : "Unavailable",
+                    AvailableUnits = c.StoreListings.Sum(sl => (int?)sl.InitialQuantity) ?? 0
                 })
                 .OrderByDescending(c => c.ListingId)
                 .Skip((page - 1) * pageSize)
@@ -539,12 +540,12 @@ namespace AutoSaleDN.Controllers
                         ListingId = sl.ListingId,
                         ShowroomId = sl.StoreLocationId,
                         ShowroomName = sl.StoreLocation.Name,
-                        Quantity = sl.CurrentQuantity
+                        Quantity = sl.InitialQuantity
                     }).ToList(),
 
                     // Derived Status and Available Units
-                    Status = c.StoreListings.Any(sl => sl.CurrentQuantity > 0) ? "Available" : "Unavailable",
-                    AvailableUnits = c.StoreListings.Sum(sl => (int?)sl.CurrentQuantity) ?? 0
+                    Status = c.StoreListings.Any(sl => sl.InitialQuantity > 0) ? "Available" : "Unavailable",
+                    AvailableUnits = c.StoreListings.Sum(sl => (int?)sl.InitialQuantity) ?? 0
                 })
                 .FirstOrDefaultAsync();
 
@@ -1360,6 +1361,42 @@ namespace AutoSaleDN.Controllers
             }
         }
 
+        [HttpGet("showrooms/{id}/car-listings")]
+        public async Task<IActionResult> GetShowroomCar(int id)
+        {
+            try
+            {
+                // Fetch car listings for the showroom
+                var carListings = await _context.StoreListings
+                    .Where(sl => sl.StoreLocationId == id)
+                    .Select(sl => new CarListingDto
+                    {
+                        ListingId = sl.CarListing.ListingId,
+                        ModelName = sl.CarListing.Model.Name, // Model name
+                        ManufacturerName = sl.CarListing.Model.Manufacturer.Name, // Brand name
+                        Price = sl.CarListing.Price, // Price from CarListing
+                        CurrentQuantity = sl.CurrentQuantity // Current quantity in showroom
+                    })
+                    .Distinct() // Avoid duplicates if multiple StoreListings for the same CarListing
+                    .OrderBy(cl => cl.ModelName)
+                    .ToListAsync();
+
+                return Ok(carListings);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, $"Internal server error: {ex.Message}");
+            }
+        }
+        public class CarListingDto
+        {
+            public int ListingId { get; set; }
+            public string ModelName { get; set; }
+            public string ManufacturerName { get; set; }
+            public decimal? Price { get; set; }
+            public int CurrentQuantity { get; set; }
+        }
+
         [HttpPost("showrooms/export")]
         public async Task<IActionResult> ExportReport([FromBody] ExportReportDto model)
         {
@@ -1833,74 +1870,25 @@ namespace AutoSaleDN.Controllers
         }
 
         // DTO for a single item in the bulk import
-        public class StockImportItemDto
-        {
-            public int ListingId { get; set; }
-            public int Quantity { get; set; }
-        }
+            public class StockImportItemDto
+            {
+                public int ListingId { get; set; }
+                public int Quantity { get; set; }
 
-        // DTO for the bulk import request
-        public class BulkStockImportDto
-        {
-            public List<StockImportItemDto> Items { get; set; }
-        }
+            }
+
+            // DTO for the bulk import request
+            public class BulkStockImportDto
+            {
+                public List<StockImportItemDto> Items { get; set; }
+            }
 
         [HttpPost("showrooms/{showroomId}/inventory/import")]
         public async Task<IActionResult> BulkImportStock(int showroomId, [FromBody] BulkStockImportDto bulkImportDto)
         {
             if (bulkImportDto == null || bulkImportDto.Items == null || !bulkImportDto.Items.Any())
             {
-                return BadRequest(new { message = "Invalid stock import data. The list of items cannot be empty." });
+                return BadRequest(new { message = "Invalid import data. Items list cannot be empty." });
             }
 
-            using (var transaction = await _context.Database.BeginTransactionAsync())
-            {
-                try
-                {
-                    foreach (var item in bulkImportDto.Items)
-                    {
-                        if (item.Quantity <= 0 || item.ListingId <= 0)
-                        {
-                            await transaction.RollbackAsync();
-                            return BadRequest(new { message = $"Invalid data for ListingId {item.ListingId}. Quantity must be positive." });
-                        }
-
-                        var storeListing = await _context.StoreListings
-                            .FirstOrDefaultAsync(sl => sl.StoreLocationId == showroomId && sl.ListingId == item.ListingId);
-
-                        if (storeListing == null)
-                        {
-                            await transaction.RollbackAsync();
-                            return NotFound(new { message = $"Car with ListingId {item.ListingId} is not allocated to this showroom." });
-                        }
-
-                        // Create a new inventory record for each import
-                        var inventoryLog = new CarInventory
-                        {
-                            StoreListingId = storeListing.StoreListingId,
-                            TransactionType = 1, // 5 for 'Stock Import'
-                            Quantity = item.Quantity,
-                            UnitPrice = 0, // Set appropriate price if needed
-                            ReferenceId = "INIT-002", // Set appropriate reference ID if needed
-                            Notes = $"Nhập mới {item.Quantity} đơn vị vào kho.",
-                            CreatedBy = User.Identity?.Name ?? "Admin",
-                            TransactionDate = DateTime.UtcNow,
-                            CreatedAt = DateTime.UtcNow
-                        };
-                        _context.CarInventories.Add(inventoryLog);
-                    }
-
-                    await _context.SaveChangesAsync();
-                    await transaction.CommitAsync();
-
-                    return Ok(new { message = "Nhập kho thành công." });
-                }
-                catch (Exception ex)
-                {
-                    await transaction.RollbackAsync();
-                    return StatusCode(500, new { message = "Có lỗi xảy ra trong quá trình nhập kho.", error = ex.Message });
-                }
-            }
-        }
-    }
 }
